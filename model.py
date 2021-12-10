@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Function
 
-from basemodel import HFLSTM, HFLinear, HFEmbedding, HFCrossEntropyLoss
+from basemodel import HFLSTM, HFLinear, HFEmbedding
 
 
 # LSTM-based language model for HF-CG(not support bi-lstm for now)
@@ -34,7 +35,7 @@ class HFLSTMLM(nn.Module):
         weight = next(self.parameters())
         return (weight.new_zeros(self.nlayers, bsz, self.nhid), weight.new_zeros(self.nlayers, bsz, self.nhid))
 
-    def forward(self, input, hidden):
+    def forward(self, input, hidden = None):
         emb = self.dropout(self.encoder(input))
         output, hidden = self.lstm(emb, hidden)
         output = self.dropout(output)
@@ -78,63 +79,38 @@ class HFLSTMLM(nn.Module):
         self.lstm.Update(alpha, beta, mode)
         self.decoder.Update(alpha, beta, mode)
 
-    def evaluate(self, val_iter, bsz, device):
-        self.eval()
-        total_loss = 0.
-        total_len = 0
-        val_hidden = self.init_hidden(bsz)
-        with torch.no_grad():
-            for i, (val_data, val_target, seq_len) in enumerate(val_iter):
-
-                val_data = val_data.to(device)
-                val_target = val_target.to(device)
-
-                val_decoded, val_hidden = self.forward(val_data, val_hidden)
-                val_hidden = repackage_hidden(val_hidden)
-                
-                total_loss += seq_len * F.cross_entropy(val_decoded, val_target).item()
-                total_len += seq_len
-        self.train()
-        return total_loss / total_len
-
-    # CG stage
-    def cg(self, data, target, val_iter, bsz, M, device):
-        best_loss = None
-        
-        # create the graph for modified EBP
-        emb = self.dropout(self.encoder(data))
-        output, hidden = self.lstm(emb)
+    # create the graph for modified EBP
+    def CreateGraph(self, input, hidden = None):
+        emb = self.dropout(self.encoder(input))
+        output, hidden = self.lstm(emb, hidden)
         output = self.dropout(output)
         decoded = self.decoder(output).view(-1, self.ntoken)
+        return emb, output, decoded
 
-        # CG iteration
-        for m in range(M):
-            self.zero_grad() # set all grads to 0 before each modified EBP
-            residualProd = self.ComputeResidualDotProduct()
-            ratio = self.ComputeRatioforStableCG() # ratio for stable CG
-            R_emb = self.encoder.Rop(data, ratio = ratio)
-            R_output = self.lstm.Rop(emb.detach(), R_emb, ratio = ratio)
-            R_decoded = self.decoder.Rop(output.detach(), R_output, ratio = ratio).view(-1, self.ntoken) / ratio
-            loss = HFCrossEntropyLoss.apply(decoded, R_decoded) # not a real loss, just a trigger for backward()
-            if m < M - 1:
-                loss.backward(retain_graph = True)
-            else:
-                loss.backward()
-            normProd = self.ComputeNormDotProduct()
-            alpha = residualProd / normProd
-            self.Update(alpha, None, 0) # update delta_theta, theta
-            self.Update(alpha, None, 3) # update r
-            beta = self.ComputeResidualDotProduct() / residualProd
-            self.Update(None, beta, 4) # update v
-            cur_loss = self.evaluate(val_iter, bsz, device) # test current update with dev data
-            if best_loss is None or cur_loss < best_loss: # update best_delta_theta
-                best_loss = cur_loss
-                self.Update(None, None, 2)
-            self.Update(None, None, 1) # reset theta
+    # modified forward propagation(a.k.a R operator)
+    def Rop(self, data, emb, output):
+        R_emb = self.encoder.Rop(data)
+        R_output = self.lstm.Rop(emb.detach(), R_emb)
+        R_decoded = self.decoder.Rop(output.detach(), R_output).view(-1, self.ntoken)
+        return R_decoded
 
-        self.Update(None, None, 5) # update theta with best_delta_theta
-        self.Update(None, None, 6) # reset r, v, delta_theta, best_delta_theta
-        return best_loss
+
+# CrossEntropyLoss for modified EBP
+class HFCrossEntropyLoss(Function):
+    @staticmethod
+    def forward(ctx, input, Jv):
+        pred = F.softmax(input, dim = 1)
+        ctx.save_for_backward(pred, Jv)
+        
+        return pred.mean() # We just use this function to do modified EBP but not to calculate the real loss,
+                           # so we return an arbitrary scalar to do loss.backward().
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        pred, Jv = ctx.saved_tensors
+        # H^hat * Jv = [diag(p) - p * p^T] * Jv
+        input_grad = pred * Jv - pred * (pred * Jv).sum(dim = 1, keepdim = True)
+        return input_grad, None
 
 
 def repackage_hidden(h):

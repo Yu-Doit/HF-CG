@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Function
 
 
 # LSTM for HF-CG(not support bi-lstm for now)
@@ -68,7 +67,7 @@ class HFLSTM(nn.LSTM):
         return vp
 
     # modified forward propagation(a.k.a R operator)
-    def Rop(self, input, R_input, hx = None, R_hx = None, ratio = None):
+    def Rop(self, input, R_input, hx = None, R_hx = None):
         L, N, _ = input.size()
         H = self.hidden_size
         orig_input = input
@@ -89,14 +88,14 @@ class HFLSTM(nn.LSTM):
                 h_t, c_t = hx[0][layer], hx[1][layer]
                 R_h_t, R_c_t = R_hx[0][layer], R_hx[1][layer]
             w_ih = getattr(self, 'weight_ih_l{}'.format(layer)).detach()
-            R_w_ih = self.v_weight_ih[layer] if ratio is None else self.v_weight_ih[layer] * ratio
+            R_w_ih = self.v_weight_ih[layer]
             w_hh = getattr(self, 'weight_hh_l{}'.format(layer)).detach()
-            R_w_hh = self.v_weight_hh[layer] if ratio is None else self.v_weight_hh[layer] * ratio
+            R_w_hh = self.v_weight_hh[layer]
             if self.bias:
                 b_ih = getattr(self, 'bias_ih_l{}'.format(layer)).detach()
-                R_b_ih = self.v_bias_ih[layer] if ratio is None else self.v_bias_ih[layer] * ratio
+                R_b_ih = self.v_bias_ih[layer]
                 b_hh = getattr(self, 'bias_hh_l{}'.format(layer)).detach()
-                R_b_hh = self.v_bias_hh[layer] if ratio is None else self.v_bias_hh[layer] * ratio
+                R_b_hh = self.v_bias_hh[layer]
             for t in range(L):
                 x = orig_input[t]
                 R_x = orig_R_input[t]
@@ -278,15 +277,10 @@ class HFLinear(nn.Linear):
         return float(vp)
 
     # modified forward propagation(a.k.a R operator)
-    def Rop(self, input, R_input, ratio = None):
-        if ratio is None:
-            R_output = F.linear(R_input, self.weight.detach()) + F.linear(input, self.v_weight)
-            if self.b:
-                R_output += self.v_bias
-        else:
-            R_output = F.linear(R_input, self.weight.detach()) + F.linear(input, self.v_weight * ratio)
-            if self.b:
-                R_output += self.v_bias * ratio
+    def Rop(self, input, R_input):
+        R_output = F.linear(R_input, self.weight.detach()) + F.linear(input, self.v_weight)
+        if self.b:
+            R_output += self.v_bias
         return R_output
 
     # v^T * B * v
@@ -372,13 +366,10 @@ class HFEmbedding(nn.Embedding):
         return float((self.v_weight * self.v_weight).sum())
 
     # modified forward propagation(a.k.a R operator)
-    def Rop(self, input, ratio):
+    def Rop(self, input):
         L, N = input.size()
         index = input.new_zeros(L, N, self.num_embeddings, dtype = torch.float).scatter_(2, input.view(L, N, 1), 1)
-        if ratio is None:
-            R_output = F.linear(index, self.v_weight.t())
-        else:
-            R_output = F.linear(index, self.v_weight.t() * ratio)
+        R_output = F.linear(index, self.v_weight.t())
         return R_output
 
     # v^T * B * v
@@ -409,21 +400,3 @@ class HFEmbedding(nn.Embedding):
             self.r_weight = None
             self.u_weight = None
             self.bu_weight = None
-
-
-# CrossEntropyLoss for modified EBP
-class HFCrossEntropyLoss(Function):
-    @staticmethod
-    def forward(ctx, input, Jv):
-        pred = F.softmax(input, dim = 1)
-        ctx.save_for_backward(pred, Jv)
-        
-        return pred.mean() # We just use this function to do modified EBP but not to calculate the real loss,
-                           # so we return an arbitrary scalar to do loss.backward().
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        pred, Jv = ctx.saved_tensors
-        # H^hat * Jv = [diag(p) - p * p^T] * Jv
-        input_grad = pred * Jv - pred * (pred * Jv).sum(dim = 1, keepdim = True)
-        return input_grad, None

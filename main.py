@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from model import HFLSTMLM, repackage_hidden
+from model import HFLSTMLM, HFCrossEntropyLoss, repackage_hidden
 from data import Corpus, DataIterator
 
 
@@ -46,8 +46,9 @@ parser.add_argument('--pre', type = str, default = None, help = 'pretrained chek
 parser.add_argument('--dry-run', action = 'store_true', help = 'verify the code and the model')
 # CG configuration
 parser.add_argument('--hfcg', action = 'store_true', help = 'use HF-CG')
-parser.add_argument('--ga_bsz', type = int, default = 500, help = 'Gradient Accumulation Stage batch size')
-parser.add_argument('--cg_bsz', type = int, default = 32, help = 'Conjuagte Gradient Stage batch size')
+parser.add_argument('--ga_workers', type = int, default = 125, help = 'number of Gradient Accumulation Stage workers')
+parser.add_argument('--cg_workers', type = int, default = 32, help = 'number of Conjuagte Gradient Stage workers')
+parser.add_argument('--minibsz', type = int, default = 32, help = 'minibatch size')
 parser.add_argument('--M', type = int, default = 10, help = 'num of CG iterations')
 args = parser.parse_args()
 
@@ -58,8 +59,8 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 
 corpus = Corpus(args.data, vocab = args.data + '/vocab.txt')
 if args.hfcg:
-    ga_iter = DataIterator(corpus.train, args.ga_bsz, args.bptt) # data iterator for GA stage
-    cg_iter = DataIterator(corpus.train, args.cg_bsz, args.bptt) # data iterator for CG stage
+    ga_iter = DataIterator(corpus.train, args.minibsz, args.bptt) # data iterator for GA stage
+    cg_iter = DataIterator(corpus.train, args.minibsz, args.bptt) # data iterator for CG stage
 else:
     train_iter = DataIterator(corpus.train, args.batch_size, args.bptt) # data iterator for 1st-order training
 val_iter = DataIterator(corpus.valid, args.eval_bsz, args.bptt)
@@ -94,42 +95,73 @@ def trainHFCG():
     model.train()
     start_time = time.time()
 
-    if args.model == 'LSTM':
-        hidden = model.init_hidden(args.ga_bsz)
-    
-    for batch, (data, target, seq_len) in enumerate(ga_iter):
-
-        model.zero_grad()
-
+    n_mini_batch = len(ga_iter) // args.bptt
+    n_ga = n_cg = 0
+    ga_batch = 0
+    while (n_mini_batch - n_ga) > 10:
         # GA stage
-        data = data.to(device)
-        target = target.to(device)
-        if args.model == 'Transformer':
-            pass
-        else:
-            hidden = repackage_hidden(hidden)
-            output, hidden = model(data, hidden)
-        loss = criterion(output, target)
-        loss.backward()
+        ga_curloss = 0.
+        n_ga_workers = min(n_mini_batch - n_ga, args.ga_workers)
+        model.zero_grad()
+        for worker in range(n_ga_workers):
+            ga_sample = (n_ga + worker) * args.bptt
+            ga_data, ga_target, _ = ga_iter.get_batch(ga_sample)
+            ga_data = ga_data.to(device)
+            ga_target = ga_target.to(device)
+            if args.model == 'Transformer':
+                pass
+            else:
+                ga_output, _ = model(ga_data)
+            ga_loss = criterion(ga_output, ga_target)
+            ga_loss.backward(torch.tensor(1 / n_ga_workers))
+            ga_curloss += (ga_loss.item() / n_ga_workers)
+        n_ga += n_ga_workers
+
         # CG stage
-        cg_sample = random.randint(0, len(cg_iter) - args.bptt)
-        cg_data, cg_target, _ = cg_iter.get_batch(cg_sample)
-        cg_data = cg_data.to(device)
-        cg_target = cg_target.to(device)
         model.init_cg()
-        best_val_loss = model.cg(cg_data, cg_target, val_iter, args.eval_bsz, args.M, device)
+        n_cg = random.randint(0, n_mini_batch - args.cg_workers)
+        best_loss = None
+        for m in range(args.M):
+            model.zero_grad() # set all grads to 0 before each modified EBP
+            for worker in range(args.cg_workers):
+                cg_sample = (n_cg + worker) * args.bptt
+                cg_data, cg_target, _ = cg_iter.get_batch(cg_sample)
+                cg_data = cg_data.to(device)
+                cg_target = cg_target.to(device)
+                if args.model == 'Transformer':
+                    pass
+                else:
+                    emb, output, decoded = model.CreateGraph(cg_data)
+                    R_decoded = model.Rop(cg_data, emb, output)
+                    loss = HFCrossEntropyLoss.apply(decoded, R_decoded) # not a real loss, just a trigger for backward()
+                    loss.backward(torch.tensor(1 / args.cg_workers))
+            residualProd = model.ComputeResidualDotProduct()
+            ratio = model.ComputeRatioforStableCG()
+            normProd = model.ComputeNormDotProduct()
+            alpha = residualProd / normProd
+            model.Update(alpha, None, 0) # update delta_theta, theta
+            model.Update(alpha, None, 3) # update r
+            beta = model.ComputeResidualDotProduct() / residualProd
+            model.Update(None, beta, 4) # update v
+            cg_loss = evaluate(val_iter) # test current update with dev data
+            if best_loss is None or cg_loss < best_loss: # update best_delta_theta
+                best_loss = cg_loss
+                model.Update(None, None, 2)
+            model.Update(None, None, 1) # reset theta
+        model.Update(None, None, 5) # update theta with best_delta_theta
+        model.Update(None, None, 6) # reset r, v, delta_theta, best_delta_theta
 
         elapsed = time.time() - start_time
         log_info = '| epoch {:3d} | batch {:2d} | s/batch {:5.2f} | GA loss {:5.2f} | CG val loss {:5.2f} | CG val ppl {:8.2f} |'.format(
-            epoch, batch, elapsed, loss.item(), best_val_loss, math.exp(best_val_loss))
+            epoch, ga_batch, elapsed, ga_curloss, best_loss, math.exp(best_loss))
         logging(log_info, log_path)
+        ga_batch += 1
         start_time = time.time()
 
 def train():
     model.train()
     total_loss = 0.
     start_time = time.time()
-    ntokens = len(corpus.vocab)
 
     if args.model == 'LSTM':
         hidden = model.init_hidden(args.batch_size)
@@ -172,7 +204,6 @@ def evaluate(data_iter):
     model.eval()
     total_loss = 0.
     total_len = 0
-    ntokens = len(corpus.vocab)
     
     if args.model == 'LSTM':
         hidden = model.init_hidden(args.eval_bsz)
@@ -191,6 +222,7 @@ def evaluate(data_iter):
             total_loss += seq_len * criterion(output, target).item()
             total_len += seq_len
 
+    model.train()
     return total_loss / total_len
 
 best_val_loss = None
@@ -207,8 +239,8 @@ def train_config():
             args.emsize, args.nhid, args.nlayers, args.dropout, 'Y' if args.tied else 'N')
     logging(log_info, log_path)
     if args.hfcg:
-        log_info = '| GA bsz: {} | CG bsz: {} | bptt: {} | varlen: {} |'.format(
-            args.ga_bsz, args.cg_bsz, args.bptt, 'Y' if args.varlen else 'N')
+        log_info = '| GA workers: {} | CG workers: {} | mini batch size: {} | M: {} | bptt: {} | varlen: {} |'.format(
+            args.ga_workers, args.cg_workers, args.minibsz, args.M, args.bptt, 'Y' if args.varlen else 'N')
     else:
         if args.optim.lower == 'sgd':
             log_info = '| bsz: {} | bptt: {} | varlen: {} | optimizer: {} | init lr: {} | momentum: {} | L2: {} |'.format(

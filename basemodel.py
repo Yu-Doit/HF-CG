@@ -115,9 +115,9 @@ class HFLSTM(nn.LSTM):
                 R_f_t = f_t * (1 - f_t) * R_gates[:, H: H * 2]
                 R_g_t = (1 - g_t * g_t) * R_gates[:, H * 2: H * 3]
                 R_o_t = o_t * (1 - o_t) * R_gates[:, H * 3: H * 4]
+                R_c_t = R_f_t * c_t + f_t * R_c_t + R_i_t * g_t + i_t * R_g_t
                 c_t = f_t * c_t + i_t * g_t
                 h_t = o_t * torch.tanh(c_t)
-                R_c_t = R_f_t * c_t + f_t * R_c_t + R_i_t * g_t + i_t * R_g_t
                 R_h_t = R_o_t * torch.tanh(c_t) + o_t * (1 - c_t * c_t) * R_c_t
                 output.append(h_t.unsqueeze(0))
                 R_output.append(R_h_t.unsqueeze(0))
